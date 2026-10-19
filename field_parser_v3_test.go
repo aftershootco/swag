@@ -174,7 +174,11 @@ func TestDefaultFieldParserV3(t *testing.T) {
 			}},
 		).ComplementSchema(schema)
 		assert.NoError(t, err)
-		assert.Equal(t, true, schema.Spec.Extensions["x-nullable"])
+		// A truthy x-nullable is expressed as the standard type union instead
+		// of a vendor extension.
+		assert.Equal(t, &spec.SingleOrArray[string]{INTEGER, NULL}, schema.Spec.Type)
+		_, hasNullableExt := schema.Spec.Extensions["x-nullable"]
+		assert.False(t, hasNullableExt)
 		assert.Equal(t, "def", schema.Spec.Extensions["x-abc"])
 		assert.Equal(t, false, schema.Spec.Extensions["x-omitempty"])
 		assert.Equal(t, "[0, 9]", schema.Spec.Extensions["x-example"])
@@ -862,5 +866,181 @@ func TestValidTagsV3(t *testing.T) {
 		).ComplementSchema(schema)
 		assert.NoError(t, err)
 		assert.Equal(t, "^[a-zA-Z0-9_]*$", schema.Spec.Pattern)
+	})
+}
+
+func TestInferNullabilityV3(t *testing.T) {
+	t.Parallel()
+
+	run := func(infer bool, fieldType ast.Expr, schemaType string, tag string) *spec.RefOrSpec[spec.Schema] {
+		schema := spec.NewSchemaSpec()
+		schema.Spec.Type = &spec.SingleOrArray[string]{schemaType}
+		if schemaType == ARRAY {
+			schema.Spec.Items = spec.NewBoolOrSchema(false, PrimitiveSchemaV3(STRING))
+		}
+		field := &ast.Field{Names: []*ast.Ident{{Name: "Field"}}, Type: fieldType}
+		if tag != "" {
+			field.Tag = &ast.BasicLit{Value: tag}
+		}
+		err := newTagBaseFieldParserV3(
+			&Parser{InferNullability: infer},
+			&ast.File{Name: &ast.Ident{Name: "test"}},
+			field,
+		).ComplementSchema(schema)
+		assert.NoError(t, err)
+		return schema
+	}
+
+	ptr := &ast.StarExpr{X: ast.NewIdent("string")}
+	slice := &ast.ArrayType{Elt: ast.NewIdent("string")}
+	fixedArr := &ast.ArrayType{Len: &ast.BasicLit{Value: "2"}, Elt: ast.NewIdent("string")}
+	mp := &ast.MapType{Key: ast.NewIdent("string"), Value: ast.NewIdent("string")}
+
+	t.Run("pointer without omitempty becomes nullable", func(t *testing.T) {
+		t.Parallel()
+		schema := run(true, ptr, STRING, `json:"test"`)
+		assert.Equal(t, &spec.SingleOrArray[string]{STRING, "null"}, schema.Spec.Type)
+	})
+
+	t.Run("untagged pointer becomes nullable", func(t *testing.T) {
+		t.Parallel()
+		schema := run(true, ptr, STRING, "")
+		assert.Equal(t, &spec.SingleOrArray[string]{STRING, "null"}, schema.Spec.Type)
+	})
+
+	t.Run("slice without omitempty becomes nullable", func(t *testing.T) {
+		t.Parallel()
+		schema := run(true, slice, ARRAY, `json:"test"`)
+		assert.Equal(t, &spec.SingleOrArray[string]{ARRAY, "null"}, schema.Spec.Type)
+	})
+
+	t.Run("map without omitempty becomes nullable", func(t *testing.T) {
+		t.Parallel()
+		schema := run(true, mp, OBJECT, `json:"test"`)
+		assert.Equal(t, &spec.SingleOrArray[string]{OBJECT, "null"}, schema.Spec.Type)
+	})
+
+	t.Run("omitempty pointer is omitted, never null", func(t *testing.T) {
+		t.Parallel()
+		schema := run(true, ptr, STRING, `json:"test,omitempty"`)
+		assert.Equal(t, &spec.SingleOrArray[string]{STRING}, schema.Spec.Type)
+	})
+
+	t.Run("negated x-nullable opts out", func(t *testing.T) {
+		t.Parallel()
+		schema := run(true, slice, ARRAY, `json:"test" extensions:"!x-nullable"`)
+		assert.Equal(t, &spec.SingleOrArray[string]{ARRAY}, schema.Spec.Type)
+	})
+
+	t.Run("fixed-size array is not nil-able", func(t *testing.T) {
+		t.Parallel()
+		schema := run(true, fixedArr, ARRAY, `json:"test"`)
+		assert.Equal(t, &spec.SingleOrArray[string]{ARRAY}, schema.Spec.Type)
+	})
+
+	t.Run("value type is unaffected", func(t *testing.T) {
+		t.Parallel()
+		schema := run(true, ast.NewIdent("string"), STRING, `json:"test"`)
+		assert.Equal(t, &spec.SingleOrArray[string]{STRING}, schema.Spec.Type)
+	})
+
+	t.Run("disabled by default", func(t *testing.T) {
+		t.Parallel()
+		schema := run(false, ptr, STRING, `json:"test"`)
+		assert.Equal(t, &spec.SingleOrArray[string]{STRING}, schema.Spec.Type)
+	})
+}
+
+func TestInferNullabilityRefV3(t *testing.T) {
+	t.Parallel()
+
+	newParser := func(infer bool) *Parser {
+		p := New()
+		p.InferNullability = infer
+		component := spec.NewSchemaSpec()
+		component.Spec.Type = &spec.SingleOrArray[string]{OBJECT}
+		if p.openAPI.Components.Spec.Schemas == nil {
+			p.openAPI.Components.Spec.Schemas = make(map[string]*spec.RefOrSpec[spec.Schema])
+		}
+		p.openAPI.Components.Spec.Schemas["Foo"] = component
+		return p
+	}
+
+	run := func(infer bool, tag string) *spec.RefOrSpec[spec.Schema] {
+		schema := &spec.RefOrSpec[spec.Schema]{Ref: spec.NewRef("#/components/schemas/Foo")}
+		field := &ast.Field{
+			Names: []*ast.Ident{{Name: "Field"}},
+			Type:  &ast.StarExpr{X: ast.NewIdent("Foo")},
+		}
+		if tag != "" {
+			field.Tag = &ast.BasicLit{Value: tag}
+		}
+		err := newTagBaseFieldParserV3(newParser(infer), &ast.File{Name: &ast.Ident{Name: "test"}}, field).ComplementSchema(schema)
+		assert.NoError(t, err)
+		return schema
+	}
+
+	t.Run("pointer to struct without omitempty becomes anyOf with null", func(t *testing.T) {
+		t.Parallel()
+		schema := run(true, `json:"test"`)
+		if assert.NotNil(t, schema.Spec) && assert.Len(t, schema.Spec.AnyOf, 2) {
+			assert.Equal(t, "#/components/schemas/Foo", schema.Spec.AnyOf[0].Ref.Ref)
+			assert.Equal(t, &spec.SingleOrArray[string]{"null"}, schema.Spec.AnyOf[1].Spec.Type)
+		}
+	})
+
+	t.Run("omitempty pointer keeps the plain ref", func(t *testing.T) {
+		t.Parallel()
+		schema := run(true, `json:"test,omitempty"`)
+		assert.NotNil(t, schema.Ref)
+		assert.Nil(t, schema.Spec)
+	})
+
+	t.Run("disabled keeps the plain ref", func(t *testing.T) {
+		t.Parallel()
+		schema := run(false, `json:"test"`)
+		assert.NotNil(t, schema.Ref)
+		assert.Nil(t, schema.Spec)
+	})
+}
+
+func TestComplementSchemaNullableExtensionV3(t *testing.T) {
+	t.Parallel()
+
+	complement := func(tag string) *spec.RefOrSpec[spec.Schema] {
+		schema := spec.NewSchemaSpec()
+		schema.Spec.Type = &spec.SingleOrArray[string]{STRING}
+		err := newTagBaseFieldParserV3(
+			&Parser{},
+			&ast.File{Name: &ast.Ident{Name: "test"}},
+			&ast.Field{
+				Names: []*ast.Ident{{Name: "Field"}},
+				Tag:   &ast.BasicLit{Value: tag},
+			},
+		).ComplementSchema(schema)
+		assert.NoError(t, err)
+		return schema
+	}
+
+	t.Run("x-nullable becomes a type union", func(t *testing.T) {
+		t.Parallel()
+		schema := complement(`json:"test" extensions:"x-nullable"`)
+		assert.Equal(t, &spec.SingleOrArray[string]{STRING, NULL}, schema.Spec.Type)
+		_, hasExt := schema.Spec.Extensions["x-nullable"]
+		assert.False(t, hasExt)
+	})
+
+	t.Run("negated x-nullable stays an extension", func(t *testing.T) {
+		t.Parallel()
+		schema := complement(`json:"test" extensions:"!x-nullable"`)
+		assert.Equal(t, &spec.SingleOrArray[string]{STRING}, schema.Spec.Type)
+		assert.Equal(t, false, schema.Spec.Extensions["x-nullable"])
+	})
+
+	t.Run("other extensions are preserved", func(t *testing.T) {
+		t.Parallel()
+		schema := complement(`json:"test" extensions:"x-nullable,x-abc=def"`)
+		assert.Equal(t, &spec.SingleOrArray[string]{STRING, NULL}, schema.Spec.Type)
+		assert.Equal(t, "def", schema.Spec.Extensions["x-abc"])
 	})
 }
